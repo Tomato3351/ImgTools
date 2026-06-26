@@ -514,8 +514,8 @@ class CanvasImage:
             box_rightdown = self.kpts_norm_list[1]
             x = (box_rightdown[0]+box_lefttop[0])/2
             y = (box_rightdown[1]+box_lefttop[1])/2
-            w = box_rightdown[0]-box_lefttop[0]
-            h = box_rightdown[1]-box_lefttop[1]
+            w = abs(box_rightdown[0]-box_lefttop[0])
+            h = abs(box_rightdown[1]-box_lefttop[1])
             obj_pose.rect = [x,y,w,h]
             obj_pose.group_id = self.new_group_id
             obj_pose.poses.clear()
@@ -560,8 +560,8 @@ class CanvasImage:
                 box_rightdown = self.kpts_norm_list[1]
                 x = (box_rightdown[0]+box_lefttop[0])/2
                 y = (box_rightdown[1]+box_lefttop[1])/2
-                w = box_rightdown[0]-box_lefttop[0]
-                h = box_rightdown[1]-box_lefttop[1]
+                w = abs(box_rightdown[0]-box_lefttop[0])
+                h = abs(box_rightdown[1]-box_lefttop[1])
                 obj_pose.rect = [x,y,w,h]
                 obj_pose.group_id = self.new_group_id
                 obj_pose.poses.clear()
