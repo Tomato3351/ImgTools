@@ -4,11 +4,101 @@ import math
 import warnings
 import tkinter as tk
 from tkinter.filedialog import askdirectory
+import json
+import re
 
 from tkinter import ttk
 from PIL import Image, ImageTk
 import os
 import glob
+
+
+DEFAULT_CLASS_NAMES = ['shuttlecock', 'racket']
+CONFIG_FILE_NAME = 'labelpose.config'
+DEFAULT_CLASS_COLORS = ['#5FA8A6', '#D98C7A', '#7A90C2', '#E3A857', '#8BBF9F', '#C78DA3', '#A7B85C', '#6FA8C9', '#C9A27E', '#9D8AC7']
+DEFAULT_CLASS_KEYPOINT_COUNTS = [1, 5]
+KEYPOINT_DIMENSION = 3
+DEFAULT_KEYPOINT_RADIUS = 3.0
+FALLBACK_COLORS = ['darkred', 'royalblue', 'darkgreen', 'darkorange', 'purple', 'teal']
+class_colors = []
+class_keypoint_counts = []
+keypoint_radius = DEFAULT_KEYPOINT_RADIUS
+
+
+def natural_sort_key(text):
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r'(\d+)', text)]
+
+
+def normalize_class_keypoint_counts(class_names, counts):
+    normalized_counts = []
+    for i in range(len(class_names)):
+        if isinstance(counts, list) and i < len(counts) and isinstance(counts[i], int) and counts[i] > 0:
+            normalized_counts.append(counts[i])
+        elif i < len(DEFAULT_CLASS_KEYPOINT_COUNTS):
+            normalized_counts.append(DEFAULT_CLASS_KEYPOINT_COUNTS[i])
+        else:
+            normalized_counts.append(DEFAULT_CLASS_KEYPOINT_COUNTS[-1])
+    return normalized_counts
+
+
+def get_class_kpt_count(class_id):
+    try:
+        idx = int(class_id)
+    except (TypeError, ValueError):
+        idx = 0
+    if idx < 0 or idx >= len(class_keypoint_counts):
+        if class_keypoint_counts:
+            return class_keypoint_counts[-1]
+        return DEFAULT_CLASS_KEYPOINT_COUNTS[-1]
+    return class_keypoint_counts[idx]
+
+
+def get_class_kpt_shape(class_id):
+    return [get_class_kpt_count(class_id), KEYPOINT_DIMENSION]
+
+
+def get_max_kpt_count():
+    if class_keypoint_counts:
+        return max(class_keypoint_counts)
+    return max(DEFAULT_CLASS_KEYPOINT_COUNTS)
+
+
+def load_labelpose_config(config_path):
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        class_names = cfg.get('class_names', [])
+        if isinstance(class_names, list) and len(class_names) > 0 and all(isinstance(x, str) and x.strip() for x in class_names):
+            colors = cfg.get('class_colors', [])
+            counts = normalize_class_keypoint_counts(class_names, cfg.get('class_keypoint_counts', []))
+            radius = cfg.get('keypoint_radius', DEFAULT_KEYPOINT_RADIUS)
+            if not isinstance(radius, (int, float)) or radius <= 0:
+                radius = DEFAULT_KEYPOINT_RADIUS
+            if isinstance(colors, list) and all(isinstance(c, str) for c in colors):
+                return class_names, colors, counts, float(radius)
+            return class_names, DEFAULT_CLASS_COLORS.copy(), counts, float(radius)
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    class_names = DEFAULT_CLASS_NAMES.copy()
+    return class_names, DEFAULT_CLASS_COLORS.copy(), normalize_class_keypoint_counts(class_names, DEFAULT_CLASS_KEYPOINT_COUNTS), DEFAULT_KEYPOINT_RADIUS
+
+
+def save_labelpose_config(config_path, class_names, colors, point_counts, point_radius):
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump({'class_names': class_names, 'class_colors': colors, 'class_keypoint_counts': point_counts, 'keypoint_radius': point_radius}, f, ensure_ascii=False, indent=2)
+        f.write('\n')
+
+
+def get_class_color(class_id):
+    if not class_colors:
+        return 'darkred'
+    try:
+        idx = int(class_id)
+    except (TypeError, ValueError):
+        idx = 0
+    if idx < 0 or idx >= len(class_colors):
+        return FALLBACK_COLORS[idx % len(FALLBACK_COLORS)]
+    return class_colors[idx]
 
     
 def float2str(f) -> str:
@@ -30,17 +120,22 @@ class Objectpose:
         self.rect = [None]*4 #center_x,center_y,w,h, normalized
         self.poses = [[None]*(kpt_shape[1]) for _ in range(kpt_shape[0])] #size follow kpt_shape
 
-    def pose2yolostr(self) -> str:
+    def pose2yolostr(self, target_kpt_count=None) -> str:
         xywh_str = float2str(self.rect[0])+" "+float2str(self.rect[1])+" "+float2str(self.rect[2])+" "+float2str(self.rect[3])
         poses_str = ""
-        for pose in self.poses:
+        padded_poses = list(self.poses)
+        if target_kpt_count is not None and target_kpt_count > len(padded_poses):
+            for _ in range(target_kpt_count - len(padded_poses)):
+                padded_poses.append([0.0, 0.0, 0.0])
+        for pose in padded_poses:
             poses_str+= float2str(pose[0]) + " " + float2str(pose[1]) + " " +float2str(pose[2]) + " "
         poses_str = poses_str[:-1]
-        return "0 " + xywh_str +" " + poses_str
+        return str(self.label) + " " + xywh_str +" " + poses_str
     
     def read_from_str(self, yolo_str, group_id):
         str_list = yolo_str.split(" ")
         self.group_id = group_id
+        self.label = int(str_list[0])
         self.rect = [float(str_list[1]),float(str_list[2]),float(str_list[3]),float(str_list[4])]
         self.poses.clear()
         for j in range(self.kpt_shape[0]):
@@ -79,9 +174,10 @@ class CanvasImage:
         """ Initialize the ImageFrame """
         self.click_cnt = 0
         self.new_group_id = 0
-        self.kpts_list = [[None]*2 for _ in range(kpt_shape[0]+2)]#left_top_pt,right_bottom_pt,kpt1,kpt2...
-        self.kpts_norm_list = [[None]*2 for _ in range(kpt_shape[0]+2)]#left_top_pt,right_bottom_pt,kpt1,kpt2...
-        self.visible_list = [None]*kpt_shape[0]
+        max_kpt_count = max(class_keypoint_counts) if class_keypoint_counts else DEFAULT_CLASS_KEYPOINT_COUNTS[-1]
+        self.kpts_list = [[None]*2 for _ in range(max_kpt_count+2)]#left_top_pt,right_bottom_pt,kpt1,kpt2...
+        self.kpts_norm_list = [[None]*2 for _ in range(max_kpt_count+2)]#left_top_pt,right_bottom_pt,kpt1,kpt2...
+        self.visible_list = [None]*max_kpt_count
         self.line_hv_inited = False
         self.obj_pose_list = []
         self.txt_name=""
@@ -370,6 +466,13 @@ class CanvasImage:
         self.line_hv_inited = True
 
     def create_rect_2p(self, event):
+        self.create_rect_2p_with_visibility(event, 2.0, 'black')
+
+    def create_rect_2p_midclk(self, event):
+        self.create_rect_2p_with_visibility(event, 1.0, 'white')
+
+    def create_rect_2p_with_visibility(self, event, visible_value, text_color):
+        current_kpt_shape = get_class_kpt_shape(current_class_id)
         x = self.canvas.canvasx(event.x)  # get coordinates of the event on the canvas
         y = self.canvas.canvasy(event.y)
         if self.outside(x, y): return  # zoom only inside image area                
@@ -377,20 +480,21 @@ class CanvasImage:
         # print(x,y)
         # print(box_image)
         # print(self.click_cnt)
-        line_width = 5* self.imscale
+        line_width = keypoint_radius * self.imscale
+        draw_color = get_class_color(current_class_id)
         
         
-        self.canvas.create_oval(x-line_width, y-line_width,x+line_width,y+line_width,outline = "darkred", fill="darkred")
+        self.canvas.create_oval(x-line_width, y-line_width,x+line_width,y+line_width,outline=draw_color, fill=draw_color)
         self.kpts_list[self.click_cnt] = [x,y]
         self.kpts_norm_list[self.click_cnt] = [(x-box_image[0])/(box_image[2]-box_image[0]),(y-box_image[1])/(box_image[3]-box_image[1])]
 
         if 1==self.click_cnt:
-            self.canvas.create_rectangle(self.kpts_list[0][0], self.kpts_list[0][1],self.kpts_list[1][0], self.kpts_list[1][1],fill='' ,outline='darkred', width=2)
+            self.canvas.create_rectangle(self.kpts_list[0][0], self.kpts_list[0][1],self.kpts_list[1][0], self.kpts_list[1][1],fill='' ,outline=draw_color, width=2)
         if self.click_cnt>1:
-            self.canvas.create_text(x, y, text=str(self.click_cnt-2),font=("Purisa", 20))
-            self.visible_list[self.click_cnt-2] = 2.0
+            self.canvas.create_text(x, y, text=str(self.click_cnt-2), font=("Purisa", 20), fill=text_color)
+            self.visible_list[self.click_cnt-2] = visible_value
         self.click_cnt+=1
-        if self.click_cnt==kpt_shape[0]+2:
+        if self.click_cnt==current_kpt_shape[0]+2:
             #one object complete
             self.click_cnt = 0
             
@@ -401,7 +505,7 @@ class CanvasImage:
             self.canvas.unbind('<ButtonPress-1>')  # remember canvas position
             self.canvas.unbind('<Motion>')  # move canvas to the new position        
             
-            obj_pose = Objectpose(label_name, kpt_shape, self.imheight, self.imwidth)
+            obj_pose = Objectpose(current_class_id, current_kpt_shape, self.imheight, self.imwidth)
             
             # print("self.kpts_list = ", self.kpts_list)
             # print("self.kpts_norm_list = ", self.kpts_norm_list)
@@ -416,12 +520,12 @@ class CanvasImage:
             obj_pose.group_id = self.new_group_id
             obj_pose.poses.clear()
             
-            for i in range(kpt_shape[0]):
+            for i in range(current_kpt_shape[0]):
                 kpt = self.kpts_norm_list[i+2]
                 vis = self.visible_list[i]
-                if 2==kpt_shape[1]:
+                if 2==current_kpt_shape[1]:
                     obj_pose.poses.append([kpt[0],kpt[1]])
-                elif 3==kpt_shape[1]:
+                elif 3==current_kpt_shape[1]:
                     obj_pose.poses.append([kpt[0],kpt[1], vis])        
                     
             self.obj_pose_list.append(obj_pose)
@@ -429,15 +533,18 @@ class CanvasImage:
             self.save_txt()
             self.new_group_id+=1
             self.__bindB1()
-        
-        
+                
     def create_rect_2p_rightclk(self, event):
+        self.create_rect_2p_missing_kpt(0.0)
+
+    def create_rect_2p_missing_kpt(self, visible_value, event=None):
+        current_kpt_shape = get_class_kpt_shape(current_class_id)
         if self.click_cnt>1:
             self.kpts_list[self.click_cnt] = [0,0]
             self.kpts_norm_list[self.click_cnt] = [0.0, 0.0]
-            self.visible_list[self.click_cnt-2] = 0.0
+            self.visible_list[self.click_cnt-2] = visible_value
             self.click_cnt+=1
-            if self.click_cnt==kpt_shape[0]+2:
+            if self.click_cnt==current_kpt_shape[0]+2:
                 #one object complete
                 self.click_cnt = 0
                 self.canvas.delete(self.line_h)
@@ -447,7 +554,7 @@ class CanvasImage:
                 self.canvas.unbind('<ButtonPress-1>')  # remember canvas position
                 self.canvas.unbind('<Motion>')  # move canvas to the new position        
                 
-                obj_pose = Objectpose(label_name, kpt_shape, self.imheight, self.imwidth)
+                obj_pose = Objectpose(current_class_id, current_kpt_shape, self.imheight, self.imwidth)
                 
                 box_lefttop = self.kpts_norm_list[0]
                 box_rightdown = self.kpts_norm_list[1]
@@ -459,12 +566,12 @@ class CanvasImage:
                 obj_pose.group_id = self.new_group_id
                 obj_pose.poses.clear()
                 
-                for i in range(kpt_shape[0]):
+                for i in range(current_kpt_shape[0]):
                     kpt = self.kpts_norm_list[i+2]
                     vis = self.visible_list[i]
-                    if 2==kpt_shape[1]:
+                    if 2==current_kpt_shape[1]:
                         obj_pose.poses.append([kpt[0],kpt[1]])
-                    elif 3==kpt_shape[1]:
+                    elif 3==current_kpt_shape[1]:
                         obj_pose.poses.append([kpt[0],kpt[1], vis])        
                         
                 self.obj_pose_list.append(obj_pose)
@@ -475,41 +582,78 @@ class CanvasImage:
         
     def add_obj_pose(self, obj_pose):
         self.obj_pose_list.append(obj_pose)
+        draw_color = get_class_color(obj_pose.label)
         box_image = self.canvas.coords(self.container)  # get image area
         left_top_pt_x_norm, left_top_pt_y_norm, right_bottom_pt_x_norm, right_bottom_pt_y_norm = obj_pose.rect2xyxy()
         left_top_pt_x = left_top_pt_x_norm*(box_image[2]-box_image[0])
         left_top_pt_y = left_top_pt_y_norm*(box_image[3]-box_image[1])
         right_bottom_pt_x = right_bottom_pt_x_norm*(box_image[2]-box_image[0])
         right_bottom_pt_y = right_bottom_pt_y_norm*(box_image[3]-box_image[1])
-        self.canvas.create_rectangle(left_top_pt_x, left_top_pt_y,right_bottom_pt_x, right_bottom_pt_y, fill='' ,outline='darkred', width=2)
-        line_width = 5* self.imscale
+        self.canvas.create_rectangle(left_top_pt_x, left_top_pt_y,right_bottom_pt_x, right_bottom_pt_y, fill='' ,outline=draw_color, width=2)
+        line_width = keypoint_radius * self.imscale
         for i in range(len(obj_pose.poses)):
             
             x = obj_pose.poses[i][0]*(box_image[2]-box_image[0])
             y = obj_pose.poses[i][1]*(box_image[3]-box_image[1])
             if (obj_pose.kpt_shape[1]==3 and obj_pose.poses[i][2]==0): continue
-            self.canvas.create_oval(x-line_width, y-line_width,x+line_width,y+line_width,outline = "darkred", fill="darkred")
-            self.canvas.create_text(x, y, text=str(i),font=("Purisa", 20))
+            text_color = 'white' if obj_pose.kpt_shape[1] == 3 and obj_pose.poses[i][2] == 1 else 'black'
+            self.canvas.create_oval(x-line_width, y-line_width,x+line_width,y+line_width,outline=draw_color, fill=draw_color)
+            self.canvas.create_text(x, y, text=str(i), font=("Purisa", 20), fill=text_color)
         self.new_group_id+=1
         
     def pop_obj_pose(self):
         self.obj_pose_list.pop()
 
     def save_txt(self):
+        target_kpt_count = get_max_kpt_count()
         with open(self.txt_name, 'w') as f:
             for tpose in self.obj_pose_list:
-                f.write(tpose.pose2yolostr()+"\n")
+                f.write(tpose.pose2yolostr(target_kpt_count)+"\n")
             f.close()
         
 def create_obj():
-    global canvas
-    #clear kpts_list
-    canvas.kpts_list = [[None]*2 for _ in range(kpt_shape[0]+2)] #left_top_pt,right_bottom_pt,kpt1,kpt2...
-    canvas.kpts_norm_list = [[None]*2 for _ in range(kpt_shape[0]+2)]#left_top_pt,right_bottom_pt,kpt1,kpt2...        
-    canvas.unbindB1()
-    canvas.canvas.bind('<ButtonPress-1>', canvas.create_rect_2p)
-    canvas.canvas.bind('<ButtonPress-3>', canvas.create_rect_2p_rightclk)
-    canvas.canvas.bind("<Motion>",canvas.move_create_rect)
+    """ Show class selection dialog, then start labeling """
+    global canvas, current_class_id
+    
+    def do_create():
+        current_kpt_count = get_class_kpt_count(current_class_id)
+        # clear kpts_list
+        canvas.click_cnt = 0
+        canvas.kpts_list = [[None]*2 for _ in range(current_kpt_count+2)] #left_top_pt,right_bottom_pt,kpt1,kpt2...
+        canvas.kpts_norm_list = [[None]*2 for _ in range(current_kpt_count+2)]#left_top_pt,right_bottom_pt,kpt1,kpt2...        
+        canvas.visible_list = [None]*current_kpt_count
+        canvas.unbindB1()
+        canvas.canvas.bind('<ButtonPress-1>', canvas.create_rect_2p)
+        canvas.canvas.bind('<ButtonPress-2>', canvas.create_rect_2p_midclk)
+        canvas.canvas.bind('<ButtonPress-3>', canvas.create_rect_2p_rightclk)
+        canvas.canvas.bind("<Motion>",canvas.move_create_rect)
+
+    def set_class(class_id):
+        global current_class_id
+        current_class_id = class_id
+        dialog.destroy()
+        do_create()
+
+    dialog = tk.Toplevel(MainWindow)
+    dialog.title("Select Class")
+    dialog.geometry("220x120")
+    dialog.transient(MainWindow)
+    dialog.grab_set()
+    # center on MainWindow
+    dialog.update_idletasks()
+    mw_x = MainWindow.winfo_rootx()
+    mw_y = MainWindow.winfo_rooty()
+    mw_w = MainWindow.winfo_width()
+    mw_h = MainWindow.winfo_height()
+    dw = dialog.winfo_width()
+    dh = dialog.winfo_height()
+    dialog.geometry(f"+{mw_x + (mw_w-dw)//2}+{mw_y + (mw_h-dh)//2}")
+
+    tk.Label(dialog, text="Choose class to label:", font=('Arial', 11)).pack(pady=(10,5))
+    for i, name in enumerate(class_names):
+        btn = tk.Button(dialog, text=f"{i} - {name}", font=('Arial', 12), width=16,
+                       fg='black', command=lambda id=i: set_class(id))
+        btn.pack(pady=2)
 
 def create_obj_ctrlr(event):
     create_obj()
@@ -526,11 +670,13 @@ def open_dir():
     global input_dir
     input_dir= askdirectory()
     MainWindow.title(input_dir)
+    image_names = []
     for im_type in img_types:
         files = glob.glob(input_dir+"/*"+im_type)
         for file in files:
-            bs_name = os.path.basename(file)
-            file_name_listbox.insert("end", bs_name)
+            image_names.append(os.path.basename(file))
+    for bs_name in sorted(image_names, key=natural_sort_key):
+        file_name_listbox.insert("end", bs_name)
             
         
 def load_img_txt(name):
@@ -547,7 +693,8 @@ def load_img_txt(name):
         with open(canvas.txt_name) as f:
             lines = f.readlines()
             for i in range(len(lines)):
-                tpose = Objectpose('tower_lattice', kpt_shape, canvas.imheight, canvas.imwidth)
+                class_id = int(lines[i].split(" ")[0])
+                tpose = Objectpose(class_id, get_class_kpt_shape(class_id), canvas.imheight, canvas.imwidth)
                 tpose.read_from_str(lines[i], i)
                 canvas.add_obj_pose(tpose)
             f.close()
@@ -578,10 +725,13 @@ def next_img():
 
     
 if __name__ == '__main__':
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, CONFIG_FILE_NAME)
+    class_names, class_colors, class_keypoint_counts, keypoint_radius = load_labelpose_config(config_path)
+    # Keep config file present and normalized on startup.
+    save_labelpose_config(config_path, class_names, class_colors, class_keypoint_counts, keypoint_radius)
+    current_class_id = 0
 
-    kpt_shape = [8,3]
-
-    label_name = 'tower_lattice'
     img_types = [".JPG",".jpg",".png",".bmp"]
 
     MainWindow = tk.Tk()
@@ -594,10 +744,13 @@ if __name__ == '__main__':
     btn_opendir.grid(row=1, column=1, columnspan=2, sticky='we')
     
     # #ListBox
-    file_name_listbox = tk.Listbox(MainWindow, height=40, width=20)
+    file_name_scrollbar = ttk.Scrollbar(MainWindow, orient='vertical')
+    file_name_listbox = tk.Listbox(MainWindow, height=40, width=20, yscrollcommand=file_name_scrollbar.set)
+    file_name_scrollbar.configure(command=file_name_listbox.yview)
 
     file_name_listbox.bind('<<ListboxSelect>>', on_select_lb_fname)
     file_name_listbox.grid(row=0, column=1, columnspan=2, sticky='nswe')
+    file_name_scrollbar.grid(row=0, column=3, sticky='ns')
 
     btn_pre = tk.Button(MainWindow, text='<-', font=('Arial', 12), width=8, height=1, command=previous_img)
     btn_pre.grid(row=2, column=1, sticky='we')
